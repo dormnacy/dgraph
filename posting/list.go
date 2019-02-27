@@ -19,6 +19,7 @@ package posting
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"log"
@@ -29,6 +30,7 @@ import (
 	"github.com/dgryski/go-farm"
 	"github.com/golang/glog"
 
+	"github.com/dgraph-io/badger"
 	bpb "github.com/dgraph-io/badger/pb"
 	"github.com/dgraph-io/dgo/protos/api"
 	"github.com/dgraph-io/dgo/y"
@@ -75,6 +77,34 @@ type List struct {
 
 	pendingTxns int32 // Using atomic for this, to avoid locking in SetForDeletion operation.
 	deleteMe    int32 // Using atomic for this, to avoid expensive SetForDeletion operation.
+	next        *List // If a multi-part list, this is a pointer to the next list.
+}
+
+func (l *List) getNextPartKey() []byte {
+	if l.plist != nil {
+		return nil
+	}
+
+	if !l.plist.MultiPart {
+		return nil
+	}
+
+	keyCopy := make([]byte, len(l.key))
+	copy(keyCopy, l.key)
+
+	if l.plist.FirstPart {
+		// Add the start of the next list to the end of the key.
+		encNexStart := make([]byte, 8)
+		binary.BigEndian.PutUint64(encNexStart, l.plist.NextPartStart)
+		keyCopy = append(keyCopy, encNexStart...)
+		return keyCopy
+	}
+
+	// In this case, the key already includes the extra bytes to encode the start
+	// UID of this part. Replace those bytes with the start UID of the next part.
+	rest := keyCopy[len(keyCopy)-8:]
+	binary.BigEndian.PutUint64(rest, l.plist.NextPartStart)
+	return keyCopy
 }
 
 func (l *List) maxVersion() uint64 {
@@ -84,41 +114,60 @@ func (l *List) maxVersion() uint64 {
 }
 
 type PIterator struct {
-	pl         *pb.PostingList
+	l          *List
 	uidPosting *pb.Posting
 	pidx       int // index of postings
 	plen       int
 
-	dec  *codec.Decoder
-	uids []uint64
-	uidx int // Offset into the uids slice
+	dec       *codec.Decoder
+	uids      []uint64
+	uidx      int // Offset into the uids slice
+	afterUid  uint64
+	discardPl bool
 }
 
-func (it *PIterator) Init(pl *pb.PostingList, afterUid uint64) {
-	it.pl = pl
+func (it *PIterator) Init(l *List, discardPl bool, afterUid uint64) {
+	it.l = l
+	it.afterUid = afterUid
+	it.discardPl = discardPl
 	it.uidPosting = &pb.Posting{}
 
-	it.dec = &codec.Decoder{Pack: pl.Pack}
+	it.dec = &codec.Decoder{Pack: l.plist.Pack}
 	it.uids = it.dec.Seek(afterUid)
 	it.uidx = 0
 
-	it.plen = len(pl.Postings)
+	it.plen = len(l.plist.Postings)
 	it.pidx = sort.Search(it.plen, func(idx int) bool {
-		p := pl.Postings[idx]
+		p := l.plist.Postings[idx]
 		return afterUid < p.Uid
 	})
 }
 
-func (it *PIterator) Next() {
+func (it *PIterator) Next() error {
+	if it.discardPl {
+		return nil
+	}
+
 	it.uidx++
 	if it.uidx < len(it.uids) {
-		return
+		if err := it.l.loadNextPart(it.l.plist.CommitTs); err != nil {
+			return nil
+		}
+		if it.l.next == nil {
+			return nil
+		}
+		it.Init(it.l.next, it.discardPl, it.afterUid)
+		return it.Next()
 	}
 	it.uidx = 0
 	it.uids = it.dec.Next()
+	return nil
 }
 
 func (it *PIterator) Valid() bool {
+	if it.discardPl {
+		return false
+	}
 	return len(it.uids) > 0
 }
 
@@ -126,7 +175,7 @@ func (it *PIterator) Posting() *pb.Posting {
 	uid := it.uids[it.uidx]
 
 	for it.pidx < it.plen {
-		p := it.pl.Postings[it.pidx]
+		p := it.l.plist.Postings[it.pidx]
 		if p.Uid > uid {
 			break
 		}
@@ -444,7 +493,7 @@ func (l *List) Conflicts(readTs uint64) []uint64 {
 	return conflicts
 }
 
-func (l *List) pickPostings(readTs uint64) (*pb.PostingList, []*pb.Posting) {
+func (l *List) pickPostings(readTs uint64) (uint64, []*pb.Posting) {
 	// This function would return zero ts for entries above readTs.
 	effective := func(start, commit uint64) uint64 {
 		if commit > 0 && commit <= readTs {
@@ -476,16 +525,9 @@ func (l *List) pickPostings(readTs uint64) (*pb.PostingList, []*pb.Posting) {
 		}
 	}
 
-	storedList := l.plist
 	if deleteBelow > 0 {
 		// There was a delete all marker. So, trim down the list of postings.
-
-		// Create an empty posting list at the same commit ts as the deletion marker. This is
-		// important, so that after rollup happens, we are left with a posting list at the
-		// highest commit timestamp.
-		storedList = &pb.PostingList{CommitTs: deleteBelow}
 		result := posts[:0]
-		// Trim the posts.
 		for _, post := range posts {
 			effectiveTs := effective(post.StartTs, post.CommitTs)
 			if effectiveTs < deleteBelow { // Do pick the posts at effectiveTs == deleteBelow.
@@ -507,13 +549,13 @@ func (l *List) pickPostings(readTs uint64) (*pb.PostingList, []*pb.Posting) {
 		}
 		return pi.Uid < pj.Uid
 	})
-	return storedList, posts
+	return deleteBelow, posts
 }
 
 func (l *List) iterate(readTs uint64, afterUid uint64, f func(obj *pb.Posting) error) error {
 	l.AssertRLock()
 
-	plist, mposts := l.pickPostings(readTs)
+	deleteBelow, mposts := l.pickPostings(readTs)
 	if readTs < l.minTs {
 		return x.Errorf("readTs: %d less than minTs: %d for key: %q", readTs, l.minTs, l.key)
 	}
@@ -528,7 +570,7 @@ func (l *List) iterate(readTs uint64, afterUid uint64, f func(obj *pb.Posting) e
 
 	var mp, pp *pb.Posting
 	var pitr PIterator
-	pitr.Init(plist, afterUid)
+	pitr.Init(l, deleteBelow > 0, afterUid)
 	prevUid := uint64(0)
 	var err error
 	for err == nil {
@@ -554,7 +596,9 @@ func (l *List) iterate(readTs uint64, afterUid uint64, f func(obj *pb.Posting) e
 		case mp.Uid == 0 || (pp.Uid > 0 && pp.Uid < mp.Uid):
 			// Either mp is empty, or pp is lower than mp.
 			err = f(pp)
-			pitr.Next()
+			if err := pitr.Next(); err != nil {
+				return err
+			}
 		case pp.Uid == 0 || (mp.Uid > 0 && mp.Uid < pp.Uid):
 			// Either pp is empty, or mp is lower than pp.
 			if mp.Op != Del {
@@ -567,7 +611,9 @@ func (l *List) iterate(readTs uint64, afterUid uint64, f func(obj *pb.Posting) e
 				err = f(mp)
 			}
 			prevUid = mp.Uid
-			pitr.Next()
+			if err := pitr.Next(); err != nil {
+				return err
+			}
 			midx++
 		default:
 			log.Fatalf("Unhandled case during iteration of posting list.")
@@ -613,20 +659,35 @@ func (l *List) Length(readTs, afterUid uint64) int {
 	return l.length(readTs, afterUid)
 }
 
-func (l *List) MarshalToKv() (*bpb.KV, error) {
+func (l *List) MarshalToKv() ([]*bpb.KV, error) {
 	l.Lock()
 	defer l.Unlock()
 	if err := l.rollup(math.MaxUint64); err != nil {
 		return nil, err
 	}
 
-	kv := &bpb.KV{}
-	kv.Version = l.minTs
-	kv.Key = l.key
-	val, meta := marshalPostingList(l.plist)
-	kv.UserMeta = []byte{meta}
-	kv.Value = val
-	return kv, nil
+	var kvs []*bpb.KV
+	curr := l
+	for {
+		kv := &bpb.KV{}
+		kv.Version = curr.minTs
+		kv.Key = curr.key
+		val, meta := marshalPostingList(curr.plist)
+		kv.UserMeta = []byte{meta}
+		kv.Value = val
+		kvs = append(kvs, kv)
+
+		// Load next part of the list if necessary.
+		if err := curr.loadNextPart(curr.plist.CommitTs); err != nil {
+			return nil, err
+		}
+		curr = curr.next
+		if curr == nil {
+			break
+		}
+	}
+
+	return kvs, nil
 }
 
 func marshalPostingList(plist *pb.PostingList) (data []byte, meta byte) {
@@ -684,8 +745,8 @@ func (l *List) rollup(readTs uint64) error {
 		// postings which had deletions to provide a sorted view of the list. Therefore, the safest
 		// way to get the max commit timestamp is to pick all the relevant postings for the given
 		// readTs and calculate the maxCommitTs.
-		plist, mposts := l.pickPostings(readTs)
-		maxCommitTs = x.Max(maxCommitTs, plist.CommitTs)
+		deleteBelow, mposts := l.pickPostings(readTs)
+		maxCommitTs = x.Max(maxCommitTs, deleteBelow)
 		for _, mp := range mposts {
 			maxCommitTs = x.Max(maxCommitTs, mp.CommitTs)
 		}
@@ -959,4 +1020,67 @@ func (l *List) Facets(readTs uint64, param *pb.FacetParams, langs []string) (fs 
 		return nil, err
 	}
 	return facets.CopyFacets(p.Facets, param), nil
+}
+
+func (l *List) loadNextPart(readTs uint64) error {
+	// No plist so there's nothing that can be loaded.
+	if l.plist == nil {
+		return nil
+	}
+	// This is not a multi-part list so nothing to load.
+	if !l.plist.MultiPart {
+		return nil
+	}
+	// The next part has already been loaded so nothing else to do.
+	if l.next != nil {
+		return nil
+	}
+	// This is the end of the multi-part list so there's nothing to do.
+	if l.plist.NextPartStart == math.MaxUint64 {
+		return nil
+	}
+
+	txn := pstore.NewTransactionAt(readTs, false)
+	opts := badger.DefaultIteratorOptions
+	opts.AllVersions = true
+	it := txn.NewIterator(opts)
+
+	nextPartKey := l.getNextPartKey()
+	if nextPartKey == nil {
+		return fmt.Errorf(
+			"Could not get find key for next part of the posting list. Current key %v", l.key)
+	}
+
+	nextListPart, err := ReadPostingList(nextPartKey, it)
+	if err != nil {
+		return err
+	}
+	l.next = nextListPart
+
+	return nil
+}
+
+func (l *List) getAllKeys() ([][]byte, error) {
+	var keys [][]byte
+
+	if !l.plist.MultiPart {
+		keys = append(keys, l.key)
+		return keys, nil
+	}
+
+	curr := l
+	for {
+		keys = append(keys, curr.key)
+
+		if err := curr.loadNextPart(curr.plist.CommitTs); err != nil {
+			return nil, err
+		}
+		if curr.next == nil {
+			break
+		}
+
+		curr = curr.next
+	}
+
+	return keys, nil
 }
